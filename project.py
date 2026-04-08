@@ -5,12 +5,16 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 import matplotlib.pyplot as plt
+
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Smart Stock Analyzer", page_icon="📈", layout="wide")
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+
+st.set_page_config(page_title="Smart Market Analyzer", page_icon="📈", layout="wide")
 
 
 # =========================
@@ -51,13 +55,67 @@ def format_large_number(num):
         return str(num)
 
 
+def get_asset_ticker(asset_type, stock_symbol="AAPL"):
+    if asset_type == "Stock":
+        return stock_symbol.strip().upper()
+    elif asset_type == "Gold":
+        return "GC=F"
+    elif asset_type == "Oil":
+        return "CL=F"
+    return stock_symbol.strip().upper()
+
+
+def get_asset_display_name(asset_type, basic, fallback_ticker):
+    if asset_type == "Stock":
+        return basic.get("Company Name", fallback_ticker)
+    return basic.get("Asset Name", asset_type)
+
+
+def get_file_prefix(asset_type, ticker):
+    if asset_type == "Gold":
+        return "gold"
+    elif asset_type == "Oil":
+        return "oil"
+    return ticker
+
+
+def recommendation_badge(recommendation):
+    rec = recommendation.lower()
+    if "buy" in rec:
+        color = "#1f9d55"
+        bg = "rgba(31,157,85,0.15)"
+    elif "hold" in rec:
+        color = "#d4a72c"
+        bg = "rgba(212,167,44,0.15)"
+    else:
+        color = "#d64545"
+        bg = "rgba(214,69,69,0.15)"
+
+    return f"""
+    <div style="
+        padding:10px 14px;
+        border-radius:14px;
+        background:{bg};
+        color:{color};
+        font-weight:700;
+        display:inline-block;
+        border:1px solid rgba(255,255,255,0.08);
+    ">
+        {recommendation}
+    </div>
+    """
+
+
+# =========================
+# EVALUATION
+# =========================
 def evaluate_metric(metric, value):
     if value is None or value == "":
         return "N/A"
 
     metric_lower = metric.lower()
 
-    if any(x in metric_lower for x in ["company name", "sector", "industry", "country", "comment", "entry"]):
+    if any(x in metric_lower for x in ["company name", "asset name", "sector", "industry", "country", "comment", "entry"]):
         return "Info"
 
     if "trend" in metric_lower:
@@ -136,6 +194,14 @@ def evaluate_metric(metric, value):
     if "macd" in metric_lower:
         return "Good" if val > 0 else "Bad"
 
+    if "ai confidence" in metric_lower:
+        if val >= 75:
+            return "Good"
+        elif val >= 60:
+            return "Mid"
+        else:
+            return "Bad"
+
     return "Info"
 
 
@@ -159,8 +225,8 @@ def explain_metric(metric):
         "market cap": "Total company market value",
         "sector": "Business sector",
         "industry": "Industry classification",
-        "average volume": "Average daily shares traded",
-        "current price": "Latest stock price",
+        "average volume": "Average daily traded amount",
+        "current price": "Latest market price",
         "beta": "Volatility versus market",
         "volatility": "Price fluctuation level",
         "macd": "Momentum indicator",
@@ -171,6 +237,10 @@ def explain_metric(metric):
         "cash": "Cash on balance sheet",
         "total equity": "Shareholders' equity",
         "risk level": "Overall trade risk",
+        "asset name": "Name of the selected market asset",
+        "ai prediction": "Machine learning prediction for next price direction",
+        "ai confidence": "Confidence score from the machine learning model",
+        "ai model": "The machine learning model used for prediction",
     }
     for key, val in meanings.items():
         if key in metric:
@@ -181,12 +251,24 @@ def explain_metric(metric):
 # =========================
 # ANALYSIS
 # =========================
-def get_fundamentals(ticker):
+def get_fundamentals(ticker, asset_type="Stock"):
     tk_obj = yf.Ticker(ticker)
     info = tk_obj.info
 
     def safe_get(k):
         return info.get(k, None)
+
+    if asset_type in ["Gold", "Oil"]:
+        default_name = "Gold" if asset_type == "Gold" else "Oil"
+        basic = {
+            "Asset Name": safe_get("shortName") or default_name,
+            "Current Price": safe_get("regularMarketPrice") or safe_get("previousClose"),
+            "52 Week High": safe_get("fiftyTwoWeekHigh"),
+            "52 Week Low": safe_get("fiftyTwoWeekLow"),
+            "Average Volume": safe_get("averageVolume"),
+        }
+        fin = {}
+        return basic, fin
 
     basic = {
         "Company Name": safe_get("shortName") or ticker,
@@ -243,10 +325,10 @@ def get_fundamentals(ticker):
 
 def compute_technical(ticker):
     tk_obj = yf.Ticker(ticker)
-    df = tk_obj.history(period="1y")
+    df = tk_obj.history(period="5y")
 
     if df.empty:
-        raise ValueError("No data found for this ticker.")
+        raise ValueError("No data found for this asset.")
 
     df["MA50"] = df["Close"].rolling(window=50).mean()
     df["MA200"] = df["Close"].rolling(window=200).mean()
@@ -328,6 +410,57 @@ def suggest_trade(tech):
     }
 
 
+# =========================
+# AI PREDICTION
+# =========================
+def ai_prediction(df):
+    data = df.copy()
+
+    required_cols = ["Close", "MA50", "MA200", "RSI", "MACD"]
+    for col in required_cols:
+        if col not in data.columns:
+            raise ValueError(f"Missing required feature: {col}")
+
+    data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
+    data = data.dropna(subset=required_cols + ["Target"])
+
+    if len(data) < 60:
+        return "Not enough data", 0.0, "Random Forest"
+
+    X = data[required_cols]
+    y = data["Target"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=True
+    )
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+
+    latest = X.iloc[[-1]]
+    pred = model.predict(latest)[0]
+    prob = model.predict_proba(latest)[0]
+
+    direction = "Up 📈" if pred == 1 else "Down 📉"
+    confidence = round(float(max(prob)) * 100, 2)
+
+    return direction, confidence, "Random Forest"
+
+
+def show_rsi_alert(rsi):
+    if rsi is None:
+        return
+    if rsi > 70:
+        st.warning("⚠️ RSI indicates overbought conditions.")
+    elif rsi < 30:
+        st.success("🔥 RSI indicates oversold conditions.")
+    else:
+        st.info("ℹ RSI is in a normal range.")
+
+
+# =========================
+# SCORING
+# =========================
 def metric_to_score(rating):
     if rating.startswith("Good"):
         return 2
@@ -365,6 +498,9 @@ def calculate_overall_score(basic, fin, tech):
     return round(avg, 2), rec
 
 
+# =========================
+# TABLES
+# =========================
 def make_df_with_rating(data_dict):
     rows = []
     for metric, value in data_dict.items():
@@ -378,7 +514,10 @@ def make_df_with_rating(data_dict):
     return pd.DataFrame(rows)
 
 
-def create_chart_figure(ticker, df, trade):
+# =========================
+# CHARTS
+# =========================
+def create_chart_figure(asset_label, df, trade):
     fig, ax = plt.subplots(figsize=(12, 5.5))
     ax.plot(df.index, df["Close"], label="Close", linewidth=1.8)
     ax.plot(df.index, df["MA50"], label="MA50", linestyle="--")
@@ -387,7 +526,7 @@ def create_chart_figure(ticker, df, trade):
     ax.axhline(trade["Resistance Level"], linestyle=":", label="Resistance")
     ax.axhline(trade["Stop Loss"], linestyle="--", label="Stop Loss")
     ax.axhline(trade["Take Profit"], linestyle="--", label="Take Profit")
-    ax.set_title(f"{ticker} Stock Analysis Chart")
+    ax.set_title(f"{asset_label} Analysis Chart")
     ax.set_xlabel("Date")
     ax.set_ylabel("Price")
     ax.grid(True, alpha=0.25)
@@ -396,6 +535,30 @@ def create_chart_figure(ticker, df, trade):
     return fig
 
 
+def create_comparison_chart(label1, df1, label2, df2):
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+
+    base1 = df1["Close"].dropna()
+    base2 = df2["Close"].dropna()
+
+    norm1 = (base1 / base1.iloc[0]) * 100
+    norm2 = (base2 / base2.iloc[0]) * 100
+
+    ax.plot(norm1.index, norm1.values, label=label1, linewidth=2)
+    ax.plot(norm2.index, norm2.values, label=label2, linewidth=2)
+
+    ax.set_title(f"{label1} vs {label2} Comparison")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Normalized Performance (Base = 100)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+
+# =========================
+# EXCEL
+# =========================
 def style_worksheet(ws):
     header_fill = PatternFill("solid", fgColor="14213D")
     header_font = Font(color="FFFFFF", bold=True)
@@ -434,25 +597,33 @@ def style_worksheet(ws):
                 cell.fill = info_fill
 
 
-def export_to_excel_bytes(ticker, basic, fin, tech, trade, score, recommendation, fig):
+def export_to_excel_bytes(file_prefix, summary_name, basic, fin, tech, trade, score, recommendation, fig, ai_info=None):
     df_basic = make_df_with_rating(basic)
     df_fin = make_df_with_rating(fin)
     df_tech = make_df_with_rating(tech)
     df_trade = make_df_with_rating(trade)
 
-    summary_df = pd.DataFrame([
-        ["Ticker", ticker],
-        ["Company", basic.get("Company Name", ticker)],
+    summary_rows = [
+        ["Asset", summary_name],
         ["Current Price", basic.get("Current Price")],
         ["Trend", tech.get("Trend")],
         ["RSI(14)", tech.get("RSI(14)")],
         ["Overall Score", score],
         ["Final Recommendation", recommendation],
-    ], columns=["Metric", "Value"])
+    ]
+
+    if ai_info:
+        summary_rows.extend([
+            ["AI Prediction", ai_info.get("AI Prediction")],
+            ["AI Confidence", ai_info.get("AI Confidence")],
+            ["AI Model", ai_info.get("AI Model")],
+        ])
+
+    summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
 
     tmp_dir = tempfile.mkdtemp()
-    xlsx_path = os.path.join(tmp_dir, f"{ticker}_analysis.xlsx")
-    chart_path = os.path.join(tmp_dir, f"{ticker}_chart.png")
+    xlsx_path = os.path.join(tmp_dir, f"{file_prefix}_analysis.xlsx")
+    chart_path = os.path.join(tmp_dir, f"{file_prefix}_chart.png")
     fig.savefig(chart_path, dpi=150, bbox_inches="tight")
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
@@ -484,7 +655,7 @@ def export_to_excel_bytes(ticker, basic, fin, tech, trade, score, recommendation
 st.markdown(
     """
     <style>
-    .stApp {background: linear-gradient(180deg, #0b1020 0%, #121a31 100%);} 
+    .stApp {background: linear-gradient(180deg, #0b1020 0%, #121a31 100%);}
     .hero {
         padding: 18px 22px;
         border-radius: 20px;
@@ -509,8 +680,10 @@ st.markdown(
 st.markdown(
     """
     <div class="hero">
-        <h1 style="margin:0;color:white;">📈 Smart Stock Analyzer</h1>
-        <p style="color:#a8b4d8;font-size:16px;margin-top:6px;">Comprehensive stock analysis using fundamentals, technicals, and AI-driven insights.</p>
+        <h1 style="margin:0;color:white;">📈 Smart Market Analyzer</h1>
+        <p style="color:#a8b4d8;font-size:16px;margin-top:6px;">
+            Comprehensive analysis for stocks, gold, and oil with comparison mode and AI prediction.
+        </p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -518,85 +691,228 @@ st.markdown(
 
 with st.sidebar:
     st.header("Controls")
-    ticker = st.text_input("Stock Symbol", value="AAPL").strip().upper()
-    analyze = st.button("Analyze Stock", use_container_width=True)
-    st.caption("Examples: AAPL, MSFT, TSLA, NVDA")
+
+    mode = st.radio("Mode", ["Single Analysis", "Comparison"])
+
+    st.subheader("Asset 1")
+    asset_type_1 = st.selectbox("Asset Type 1", ["Stock", "Gold", "Oil"], key="asset1")
+
+    if asset_type_1 == "Stock":
+        stock_symbol_1 = st.text_input("Stock Symbol 1", value="AAPL").strip().upper()
+    else:
+        stock_symbol_1 = ""
+
+    if mode == "Comparison":
+        st.subheader("Asset 2")
+        asset_type_2 = st.selectbox("Asset Type 2", ["Stock", "Gold", "Oil"], key="asset2")
+
+        if asset_type_2 == "Stock":
+            stock_symbol_2 = st.text_input("Stock Symbol 2", value="MSFT").strip().upper()
+        else:
+            stock_symbol_2 = ""
+    else:
+        asset_type_2 = None
+        stock_symbol_2 = ""
+
+    analyze = st.button("Analyze", use_container_width=True)
+    st.caption("Examples: Stock = AAPL, TSLA | Gold | Oil")
 
 if analyze:
-    if not is_valid_ticker(ticker):
-        st.error("Please enter a valid ticker like AAPL or MSFT.")
+    ticker1 = get_asset_ticker(asset_type_1, stock_symbol_1)
+
+    if asset_type_1 == "Stock" and not is_valid_ticker(ticker1):
+        st.error("Please enter a valid first stock ticker.")
     else:
-        with st.spinner("Analyzing stock data..."):
-            try:
-                basic, fin = get_fundamentals(ticker)
-                tech, df = compute_technical(ticker)
-                trade = suggest_trade(tech)
-                score, recommendation = calculate_overall_score(basic, fin, tech)
-                fig = create_chart_figure(ticker, df, trade)
+        try:
+            basic1, fin1 = get_fundamentals(ticker1, asset_type=asset_type_1)
+            tech1, df1 = compute_technical(ticker1)
+            trade1 = suggest_trade(tech1)
+            score1, recommendation1 = calculate_overall_score(basic1, fin1, tech1)
+            asset_name1 = get_asset_display_name(asset_type_1, basic1, ticker1)
+            file_prefix1 = get_file_prefix(asset_type_1, ticker1)
+
+            if mode == "Single Analysis":
+                fig1 = create_chart_figure(asset_name1, df1, trade1)
+                ai_dir, ai_conf, ai_model = ai_prediction(df1)
 
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    st.markdown(f'<div class="metric-card"><div class="small-label">Company</div><div class="big-value">{basic.get("Company Name", ticker)}</div></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="metric-card"><div class="small-label">📌 Asset</div><div class="big-value">{asset_name1}</div></div>',
+                        unsafe_allow_html=True
+                    )
                 with c2:
-                    st.markdown(f'<div class="metric-card"><div class="small-label">Current Price</div><div class="big-value">{format_large_number(basic.get("Current Price"))}</div></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="metric-card"><div class="small-label">💰 Current Price</div><div class="big-value">{format_large_number(basic1.get("Current Price"))}</div></div>',
+                        unsafe_allow_html=True
+                    )
                 with c3:
-                    st.markdown(f'<div class="metric-card"><div class="small-label">Trend</div><div class="big-value">{tech.get("Trend", "N/A")}</div></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="metric-card"><div class="small-label">📈 Trend</div><div class="big-value">{tech1.get("Trend", "N/A")}</div></div>',
+                        unsafe_allow_html=True
+                    )
                 with c4:
-                    st.markdown(f'<div class="metric-card"><div class="small-label">Recommendation</div><div class="big-value">{recommendation}</div></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="metric-card"><div class="small-label">🤖 AI Prediction</div><div class="big-value">{ai_dir}</div></div>',
+                        unsafe_allow_html=True
+                    )
 
-                st.markdown("")
+                st.markdown("### Recommendation")
+                st.markdown(recommendation_badge(recommendation1), unsafe_allow_html=True)
+
+                st.markdown("### Overall Score")
+                st.progress(min(score1 / 2, 1.0))
+                st.write(f"Score: **{score1} / 2.0**")
+
+                show_rsi_alert(tech1.get("RSI(14)"))
+
                 left, right = st.columns([1.5, 1])
 
                 with left:
                     st.subheader("Price Chart")
-                    st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig1, use_container_width=True)
 
                 with right:
                     st.subheader("Decision Summary")
-                    st.write(f"**Overall Score:** {score}")
-                    st.write(f"**RSI(14):** {tech.get('RSI(14)')}")
-                    st.write(f"**MACD:** {tech.get('MACD')}")
-                    st.write(f"**Risk Level:** {trade.get('Risk Level')}")
-                    st.write(f"**Comment:** {trade.get('Comment')}")
+                    st.write(f"**Overall Score:** {score1}")
+                    st.write(f"**RSI(14):** {tech1.get('RSI(14)')}")
+                    st.write(f"**MACD:** {tech1.get('MACD')}")
+                    st.write(f"**Risk Level:** {trade1.get('Risk Level')}")
+                    st.write(f"**Comment:** {trade1.get('Comment')}")
 
-                tab1, tab2, tab3, tab4, tab5 = st.tabs(["Summary", "Fundamentals", "Financials", "Technical", "Trade Plan"])
+                    st.subheader("AI Module")
+                    st.write(f"**Prediction:** {ai_dir}")
+                    st.write(f"**Confidence:** {ai_conf}%")
+                    st.write(f"**Model:** {ai_model}")
+
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+                    ["Summary", "Fundamentals", "Financials", "Technical", "Trade Plan", "AI Insights"]
+                )
 
                 summary_df = make_df_with_rating({
-                    "Ticker": ticker,
-                    "Company": basic.get("Company Name"),
-                    "Current Price": basic.get("Current Price"),
-                    "Trend": tech.get("Trend"),
-                    "RSI(14)": tech.get("RSI(14)"),
-                    "Overall Score": score,
-                    "Final Recommendation": recommendation,
+                    "Asset": asset_name1,
+                    "Current Price": basic1.get("Current Price"),
+                    "Trend": tech1.get("Trend"),
+                    "RSI(14)": tech1.get("RSI(14)"),
+                    "Overall Score": score1,
+                    "Final Recommendation": recommendation1,
+                })
+
+                ai_df = make_df_with_rating({
+                    "AI Prediction": ai_dir,
+                    "AI Confidence": ai_conf,
+                    "AI Model": ai_model,
                 })
 
                 with tab1:
                     st.dataframe(summary_df, use_container_width=True, hide_index=True)
                 with tab2:
-                    st.dataframe(make_df_with_rating(basic), use_container_width=True, hide_index=True)
+                    st.dataframe(make_df_with_rating(basic1), use_container_width=True, hide_index=True)
                 with tab3:
-                    st.dataframe(make_df_with_rating(fin), use_container_width=True, hide_index=True)
+                    st.dataframe(make_df_with_rating(fin1), use_container_width=True, hide_index=True)
                 with tab4:
-                    st.dataframe(make_df_with_rating(tech), use_container_width=True, hide_index=True)
+                    st.dataframe(make_df_with_rating(tech1), use_container_width=True, hide_index=True)
                 with tab5:
-                    st.dataframe(make_df_with_rating(trade), use_container_width=True, hide_index=True)
+                    st.dataframe(make_df_with_rating(trade1), use_container_width=True, hide_index=True)
+                with tab6:
+                    st.dataframe(ai_df, use_container_width=True, hide_index=True)
 
-                excel_bytes = export_to_excel_bytes(ticker, basic, fin, tech, trade, score, recommendation, fig)
+                excel_bytes = export_to_excel_bytes(
+                    file_prefix=file_prefix1,
+                    summary_name=asset_name1,
+                    basic=basic1,
+                    fin=fin1,
+                    tech=tech1,
+                    trade=trade1,
+                    score=score1,
+                    recommendation=recommendation1,
+                    fig=fig1,
+                    ai_info={
+                        "AI Prediction": ai_dir,
+                        "AI Confidence": ai_conf,
+                        "AI Model": ai_model,
+                    }
+                )
+
                 st.download_button(
                     "Download Excel Report",
                     data=excel_bytes,
-                    file_name=f"{ticker}_analysis.xlsx",
+                    file_name=f"{file_prefix1}_analysis.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
 
-            except Exception as e:
-                st.error(f"Analysis failed: {e}")
+            else:
+                ticker2 = get_asset_ticker(asset_type_2, stock_symbol_2)
+
+                if asset_type_2 == "Stock" and not is_valid_ticker(ticker2):
+                    st.error("Please enter a valid second stock ticker.")
+                else:
+                    basic2, fin2 = get_fundamentals(ticker2, asset_type=asset_type_2)
+                    tech2, df2 = compute_technical(ticker2)
+                    trade2 = suggest_trade(tech2)
+                    score2, recommendation2 = calculate_overall_score(basic2, fin2, tech2)
+                    asset_name2 = get_asset_display_name(asset_type_2, basic2, ticker2)
+
+                    st.subheader("Comparison Overview")
+
+                    a, b = st.columns(2)
+                    with a:
+                        st.markdown(
+                            f'<div class="metric-card"><div class="small-label">Asset 1</div><div class="big-value">{asset_name1}</div></div>',
+                            unsafe_allow_html=True
+                        )
+                        st.write(f"**Price:** {format_large_number(basic1.get('Current Price'))}")
+                        st.write(f"**Trend:** {tech1.get('Trend')}")
+                        st.write(f"**RSI:** {tech1.get('RSI(14)')}")
+                        st.markdown(recommendation_badge(recommendation1), unsafe_allow_html=True)
+                        st.progress(min(score1 / 2, 1.0))
+                        st.write(f"Score: **{score1} / 2.0**")
+
+                    with b:
+                        st.markdown(
+                            f'<div class="metric-card"><div class="small-label">Asset 2</div><div class="big-value">{asset_name2}</div></div>',
+                            unsafe_allow_html=True
+                        )
+                        st.write(f"**Price:** {format_large_number(basic2.get('Current Price'))}")
+                        st.write(f"**Trend:** {tech2.get('Trend')}")
+                        st.write(f"**RSI:** {tech2.get('RSI(14)')}")
+                        st.markdown(recommendation_badge(recommendation2), unsafe_allow_html=True)
+                        st.progress(min(score2 / 2, 1.0))
+                        st.write(f"Score: **{score2} / 2.0**")
+
+                    show_rsi_alert(tech1.get("RSI(14)"))
+                    show_rsi_alert(tech2.get("RSI(14)"))
+
+                    fig_compare = create_comparison_chart(asset_name1, df1, asset_name2, df2)
+                    st.subheader("Comparison Chart")
+                    st.pyplot(fig_compare, use_container_width=True)
+
+                    comp_df = pd.DataFrame([
+                        {
+                            "Asset": asset_name1,
+                            "Current Price": format_large_number(basic1.get("Current Price")),
+                            "Trend": tech1.get("Trend"),
+                            "RSI(14)": tech1.get("RSI(14)"),
+                            "MACD": tech1.get("MACD"),
+                            "Score": score1,
+                            "Recommendation": recommendation1,
+                        },
+                        {
+                            "Asset": asset_name2,
+                            "Current Price": format_large_number(basic2.get("Current Price")),
+                            "Trend": tech2.get("Trend"),
+                            "RSI(14)": tech2.get("RSI(14)"),
+                            "MACD": tech2.get("MACD"),
+                            "Score": score2,
+                            "Recommendation": recommendation2,
+                        },
+                    ])
+
+                    st.subheader("Comparison Table")
+                    st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
 else:
-    st.info("Enter a stock ticker from the sidebar, then press Analyze Stock.")
-
-
-
-
-#streamlit run project.py 
+    st.info("Choose mode and assets from the sidebar, then press Analyze.")
